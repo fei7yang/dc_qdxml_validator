@@ -1,0 +1,74 @@
+Validation逻辑
+
+══════════════════════════════════════════════
+Cluster 定义
+══════════════════════════════════════════════
+APP01~10    TcClusterJiTuan1
+APP11~20    TcClusterJiTuan2
+APP21~30    TcClusterJiTuan3
+APP31~38    TcClusterJiTuan4
+APP39~40    TcClusterHaiWai
+APP41~42    TcClusterXinJishuYuan
+APP43~44    TcClusterJiChuYuan
+APP45~52    TcClusterJieKou
+
+══════════════════════════════════════════════
+规则 1 — Web → Pool (fnd0_j2ee_tcwebtier → fnd0_serverManager)
+══════════════════════════════════════════════
+类型: 多对多 (full-mesh intra-cluster)
+规则: 每个WT连接同cluster内所有SM（交叉全连接）
+示例: APP01的WT → 连接APP01~10所有SM (10条)
+      APP45的WT → 连接APP45~52所有SM (8条)
+校验: WT只保留同cluster内的<connectedTo component="fnd0_serverManager">，删除跨cluster的
+连线总数预期: 10*10+10*10+10*10+8*8+2*2+2*2+2*2+8*8 = 440
+
+══════════════════════════════════════════════
+规则 2 — Gateway → VisPoolAssigner
+══════════════════════════════════════════════
+类型: 一对一 (奇偶配对)
+规则: Gateway按编号奇偶连接对应VIS
+      奇数Gateway(01/41) → VIS01
+      偶数Gateway(02/42) → VIS02
+组件: aws2_client_gateway_webtier → aws2_vispoolassigner
+
+══════════════════════════════════════════════
+规则 3 — BL Server-Dispatcher → Web
+══════════════════════════════════════════════
+类型: 一对一
+规则: 2-tier BL Server on Dispatcher(DISP01/02) 连接1个Web即可
+      DISP01 → APP45 (JieKou, 口Web)
+      DISP02 → APP46 (JieKou, 口Web)
+说明: 后期不需要调整LB
+
+══════════════════════════════════════════════
+规则 4 — BL Server-DC → Web
+══════════════════════════════════════════════
+类型: 一对一
+规则: 2-tier BL Server on DC01 连接1个Web即可
+      DC01 → APP47 (JieKou, 口Web)
+说明: 后期不需要调整LB
+
+══════════════════════════════════════════════
+规则 5 — Dispatcher Client-4tier → Web
+══════════════════════════════════════════════
+类型: 一对一
+规则: 4-tier Dispatcher Client 随便连1个Web
+      BYD_4TIER_PRD → APP52 (JieKou)
+说明: 后期调整为LBWEB-接口
+
+══════════════════════════════════════════════
+规则 6 — Indexer → Web
+══════════════════════════════════════════════
+类型: 一对一
+规则: FTS Indexer 随便连1个Web
+      aws2_ftsIndexer → APP52 (JieKou)
+说明: 后期调整为LBWEB-接口
+
+══════════════════════════════════════════════
+规则 7 — VisPoolAssigner → Web
+══════════════════════════════════════════════
+类型: 一对一
+规则: VIS Pool Assigner 随便连1个Web
+      VIS01 → APP52 (JieKou)
+      VIS02 → APP52 (JieKou)
+说明: 后期调整为LBWEB-接口

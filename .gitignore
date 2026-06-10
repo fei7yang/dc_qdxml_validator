@@ -1,0 +1,13 @@
+# XML files - never upload
+*.xml
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Conversation records
+_conversation_records/
+
+# OS files
+Thumbs.db
+.DS_Store
