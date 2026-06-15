@@ -5,8 +5,15 @@
 __pycache__/
 *.pyc
 
+# Build output (exe too large for git)
+build/
+output/
+
 # Conversation records
 _conversation_records/
+
+# Output HTML reports (generated, not source)
+*.html
 
 # OS files
 Thumbs.db

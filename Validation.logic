@@ -6,11 +6,12 @@ Cluster 定义
 APP01~10    TcClusterJiTuan1
 APP11~20    TcClusterJiTuan2
 APP21~30    TcClusterJiTuan3
-APP31~38    TcClusterJiTuan4
-APP39~40    TcClusterHaiWai
+APP31~40    TcClusterJiTuan4
 APP41~42    TcClusterXinJishuYuan
 APP43~44    TcClusterJiChuYuan
 APP45~52    TcClusterJieKou
+APP53~54    TcClusterTest
+APP55~56    TcClusterHaiWai
 
 ══════════════════════════════════════════════
 规则 1 — Web → Pool (fnd0_j2ee_tcwebtier → fnd0_serverManager)
@@ -20,7 +21,7 @@ APP45~52    TcClusterJieKou
 示例: APP01的WT → 连接APP01~10所有SM (10条)
       APP45的WT → 连接APP45~52所有SM (8条)
 校验: WT只保留同cluster内的<connectedTo component="fnd0_serverManager">，删除跨cluster的
-连线总数预期: 10*10+10*10+10*10+8*8+2*2+2*2+2*2+8*8 = 440
+连线总数预期: 10*10+10*10+10*10+10*10+2*2+2*2+8*8+2*2+2*2 = 480
 
 ══════════════════════════════════════════════
 规则 2 — Gateway → VisPoolAssigner
@@ -72,3 +73,77 @@ APP45~52    TcClusterJieKou
       VIS01 → APP52 (JieKou)
       VIS02 → APP52 (JieKou)
 说明: 后期调整为LBWEB-接口
+
+══════════════════════════════════════════════
+规则 8 — Gateway → Web (aws2_client_gateway_webtier → fnd0_j2ee_tcwebtier)
+══════════════════════════════════════════════
+类型: 一对一 (必须)
+规则: 每个Gateway连自己所在台的Web Tier
+      APP01 Gateway → APP01 Web
+      APP02 Gateway → APP02 Web
+      APP41 Gateway → APP41 Web
+      APP42 Gateway → APP42 Web
+      APP55 Gateway → APP55 Web
+      APP56 Gateway → APP56 Web
+校验: Gateway必须有一条<connectedTo component="fnd0_j2ee_tcwebtier">指向自己machineName
+
+══════════════════════════════════════════════
+组件数量约定
+══════════════════════════════════════════════
+① fnd0_corporateserver: 全局只有1个(APP01), 不分发给各台; APP01不需要blserver client
+② fnd0_blserver: 每台APP1个. 额外BL: DC01(+2tier), DISP01/02(+2tier) 各+1个BL
+③ 每新增1台APP = 新增: 1×SM + 1×Web + 1×FSC + 1×BL Server
+④ 新增2-tier Client或Dispatcher = 新增BL Server, 但不新增FSC
+⑤ 新增集群需同步添加: 2tierrichclient (对应APP), gateway (如有需要)
+
+══════════════════════════════════════════════
+规则 9 — 全连接组件 (新增APP时必须同步更新)
+══════════════════════════════════════════════
+以下组件的 connectedTo 为全连接, 新增APP时需一并追加:
+  fnd0_servermgrconsole (APP01)     → 所有 SM + 所有 Web
+  fnd0_microservice (MSF01)         → 所有 Web
+  fnd0_dispatcherModule (DISP01)    → 所有 Web + 所有 BL Server
+  fnd0_dispatcherModule (DISP02)    → 所有 Web + 所有 BL Server
+  aws2_client_gateway_webtier (各台) → 所有 FSC
+
+══════════════════════════════════════════════
+规则 10 — FSC 连接规则
+══════════════════════════════════════════════
+FSC 总数: 86 (56 pool FSC[APP01-56] + 30 standalone/cache FSC)
+Master FSC: 9个 (APP01 + FSC01-08), isMaster=true
+Non-Master FSC: 77个 (APP02-56 co-located + 22 cache + 8 non-master standalone)
+
+连接规则:
+  Master FSC → 所有86个FSC (含自己和其他Master) = 86条 connectedTo fnd0_fsc
+  Non-Master FSC → 只连9个Master FSC = 9条 connectedTo fnd0_fsc
+  Master FSC不应只连Non-Master, 也不应遗漏任何FSC
+
+══════════════════════════════════════════════
+BYD 架构原则
+══════════════════════════════════════════════
+① 新增 Server Manager = +1 SM +1 Web +1 FSC +1 BL Server
+② 新增 2-tier Client 或 Dispatcher = +1 BL Server (不新增 FSC)
+③ DC01/DISP01/DISP02 有 BL Server 但没有 FSC ✅
+④ APP01 是 corporateserver, 不是普通 BL Server, 不需要 blserver client
+⑤ Gateway APP55/56 (海外集群) 只连海外相关 FSC, 不连国内 APP/FSC (as design)
+⑥ fnd0_blserver 是 <client> (quickDeployClients 下), 不是 <component>
+
+══════════════════════════════════════════════
+格式检查
+══════════════════════════════════════════════
+① XML 标签不得出现 </xxx><yyy 在同一行的情况
+   正确: </component>
+         <component ...>
+   错误: </component><component ...>
+② 组件按类型分组排列 (所有 fnd0_j2ee_tcwebtier 在一起, 所有 fnd0_serverManager 在一起...)
+③ 新组件插入在对应类型组内, 不得追加到文件末尾
+④ 缩进: 根节点0空格, component/client 8空格, property/connectedTo/package 12空格
+
+══════════════════════════════════════════════
+规则 11 — 同组件内 connectedTo 类型分组
+══════════════════════════════════════════════
+规则: 同一组件内, 同类型 connectedTo 必须连续, 不得交叉
+示例: fnd0_servermgrconsole 内:
+  正确: [Web×56] [SM×56]
+  错误: [Web×52] [SM×52] [Web×4] [SM×4]
+校验: 扫描每个多类型组件, connectedTo 类型切换次数 = (去重类型数)-1
