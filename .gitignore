@@ -8,6 +8,7 @@ __pycache__/
 # Build output (exe too large for git)
 build/
 output/
+*.spec
 
 # Conversation records
 _conversation_records/

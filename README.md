@@ -1,85 +1,123 @@
 # dc_qdxml_validator
 
-Teamcenter Quick Deploy XML Connection Validation Rules
+Teamcenter Quick Deploy XML Connection Validation & Report Tool
 
-Defines 7 connection rules for validating TC Quick Deploy XML configurations. Used to verify that component connections (`<connectedTo>`) conform to the expected architecture topology.
+Validates `<connectedTo>` relationships in TC Quick Deploy XML files against 11 architecture rules, then generates per-component HTML reports. **Fully dynamic** — no hardcoded hostnames, no external mapping files, no re-packaging needed when servers change.
+
+## Features
+
+- **11 validation rules** covering full-mesh, odd/even pairing, 1:1 mapping, and full-connection checks
+- **Dynamic discovery**: Clusters, roles, and hostnames are all inferred from XML content — zero hardcoded names
+- **Per-component reports**: 30+ HTML reports with connection details, property patterns, and cross-reference
+- **Auto-detect XML**: Double-click the exe to find and validate the XML in the same directory
+- **Config-aware titles**: Reports use the XML's `<configName>` as header
+- **Zero external dependencies**: No mapping files, no config files — just the exe and the XML
 
 ## Validation Rules
 
 | Rule | Type | Source → Target | Description |
 |------|------|-----------------|-------------|
-| R1 | Full-mesh (intra-cluster) | Web Tier → Server Manager | Each WT connects to all SMs in the same cluster |
-| R2 | Odd/Even 1:1 | Gateway → VIS Pool Assigner | Odd-numbered Gateway → VIS01, Even → VIS02 |
-| R3 | 1:1 | BL-Dispatcher → Web | DISP01→APP45, DISP02→APP46 |
-| R4 | 1:1 | BL-DC → Web | DC01→APP47 |
-| R5 | 1:1 | Dispatcher-4tier → Web | BYD_4TIER_PRD→APP52 |
-| R6 | 1:1 | FTS Indexer → Web | aws2_ftsIndexer→APP52 |
-| R7 | 1:1 | VIS Pool Assigner → Web | VIS01→APP52, VIS02→APP52 |
+| R1 | Full-mesh | Web Tier → Server Manager | Each WT connects to all SMs in the same cluster |
+| R2 | Odd/Even 1:1 | Gateway → VIS Pool Assigner | Odd-numbered GW → VIS[0], Even → VIS[1] |
+| R3 | 1:1 | BL-Dispatcher → Web | DISP BL connects to Web |
+| R4 | 1:1 | BL-DC → Web | DC BL connects to Web |
+| R5 | 1:1 | 4tier Client → Web | 4-tier rich client connects to a Web |
+| R6 | 1:1 | FTS Indexer → Web | Indexer connects to a Web |
+| R7 | 1:1 | VIS Pool Assigner → Web | VIS pool connects to a Web |
+| R8 | Same-host | Gateway → Web | Gateway must connect to its own Web (same machine) |
+| R9 | Full-connection | Special components | Console, MSF, Dispatcher, Gateway, VIS, FSC all have full-connection checks |
+| R10 | FSC Master/Non-Master | FSC → FSC | Master FSC → all FSCs; Non-Master → Master FSCs only |
+| R11 | Sequential | connectedTo | Same-type connectedTo entries must be sequential within a component |
 
-## Cluster Definitions
+## Dynamic Discovery
 
-| Cluster | APP Range |
-|---------|-----------|
-| TcClusterJiTuan1 | APP01-10 |
-| TcClusterJiTuan2 | APP11-20 |
-| TcClusterJiTuan3 | APP21-30 |
-| TcClusterJiTuan4 | APP31-38 |
-| TcClusterHaiWai | APP39-40 |
-| TcClusterXinJishuYuan | APP41-42 |
-| TcClusterJiChuYuan | APP43-44 |
-| TcClusterJieKou | APP45-52 |
+All validation is driven by XML content — no hardcoded hostnames or cluster definitions:
 
-## Rule Details
+- **Clusters**: Built from `fnd0_serverManagerDisplayClusterId` on SM components
+- **APP numbering**: Extracted from machineName via regex (works with any prefix like `APP01` or `jttcapp01`)
+- **DISP identification**: Machines with `fnd0_dispatcherModule` component
+- **DC identification**: BL servers not on SM or DISP machines
+- **Corporate server**: Detected via `fnd0_corporateserver` component
+- **FSC Master/Cache**: Detected via `fnd0_isMaster` property
+- **Full-connection components**: Found dynamically by component ID
 
-### R1: Web → Pool (Full-mesh intra-cluster)
+## Usage
 
-- **Component**: `fnd0_j2ee_tcwebtier` → `fnd0_serverManager`
-- **Rule**: Each WT connects to all SMs within the same cluster (full cross-connection)
-- **Example**: APP01's WT → connects to APP01-10's SMs (10 links); APP45's WT → connects to APP45-52's SMs (8 links)
-- **Validation**: WT should only keep `<connectedTo component="fnd0_serverManager">` entries within the same cluster; cross-cluster connections should be removed
-- **Expected total**: 10×10 + 10×10 + 10×10 + 8×8 + 2×2 + 2×2 + 2×2 + 8×8 = **440 links**
+### Standalone EXE
 
-### R2: Gateway → VisPoolAssigner (Odd/Even)
+```bash
+# Double-click to auto-detect XML and run all checks + generate reports
+dc_qdxml_validator.exe
 
-- **Component**: `aws2_client_gateway_webtier` → `aws2_vispoolassigner`
-- **Rule**: Odd-numbered Gateway (01, 41) → VIS01; Even-numbered (02, 42) → VIS02
+# Specify XML path
+dc_qdxml_validator.exe path/to/config.xml
 
-### R3: BL-Dispatcher → Web (1:1)
+# Run checks only (no reports)
+dc_qdxml_validator.exe config.xml --check
 
-- **Component**: `fnd0_blserver` → `fnd0_j2ee_tcwebtier`
-- **Rule**: DISP01→APP45, DISP02→APP46 (JieKou cluster)
+# Generate report for a specific component
+dc_qdxml_validator.exe config.xml --report fnd0_fsc
 
-### R4: BL-DC → Web (1:1)
+# Generate all reports
+dc_qdxml_validator.exe config.xml --all
+```
 
-- **Component**: `fnd0_blserver` → `fnd0_j2ee_tcwebtier`
-- **Rule**: DC01→APP47 (JieKou cluster)
+### Python Script
 
-### R5: Dispatcher-4tier → Web (1:1)
+```bash
+python dc_qdxml_validator.py config.xml
+```
 
-- **Component**: `fnd0_dispatcherclient` → `fnd0_j2ee_tcwebtier`
-- **Rule**: BYD_4TIER_PRD→APP52 (JieKou cluster)
+### Output
 
-### R6: Indexer → Web (1:1)
+Check results print to console. Reports are generated in `./validator/` subdirectory:
 
-- **Component**: `aws2_ftsIndexer` → `fnd0_j2ee_tcwebtier`
-- **Rule**: aws2_ftsIndexer→APP52 (JieKou cluster)
+| File | Description |
+|------|-------------|
+| `validator/index.html` | Report index page |
+| `validator/report_<cid>.html` | Per-component detail report |
+| `validator/validator_style.css` | Shared report stylesheet |
 
-### R7: VisPoolAssigner → Web (1:1)
+## Component Count Standards
 
-- **Component**: `aws2_vispoolassigner` → `fnd0_j2ee_tcwebtier`
-- **Rule**: VIS01→APP52, VIS02→APP52 (JieKou cluster)
+For 56 APP servers:
+
+| Component | Count |
+|-----------|-------|
+| fnd0_j2ee_tcwebtier | 56 |
+| fnd0_serverManager | 56 |
+| fnd0_blserver | 58 (55 APP + DC01 + DISP01 + DISP02) |
+| fnd0_fsc | 86 (9 Master + 55 co-located + 22 cache) |
+| fnd0_corporateserver | 1 |
+| fnd0_2tierrichclient | 13 |
+| aws2_client_gateway_webtier | 6 |
+| fnd0_tccs | 17 |
+
+## Building the EXE
+
+Requires Python 3.13+ and PyInstaller:
+
+```bash
+pip install pyinstaller lxml
+pyinstaller --onefile --distpath output --workpath build dc_qdxml_validator.py
+```
+
+Output: `output/dc_qdxml_validator.exe` (~13MB)
 
 ## File Structure
 
 ```
 dc_qdxml_validator/
-├── Validation.logic    # Human-readable validation rules (7 rules)
+├── dc_qdxml_validator.py    # Main script (single file, all-in-one)
+├── output/
+│   └── dc_qdxml_validator.exe
 └── README.md
 ```
 
 ## Related Projects
 
 - **[dc_qdxml_to_arch](https://github.com/fei7yang/dc_qdxml_to_arch)** — TC Quick Deploy XML → Architecture Visualization Tool
+- **[dc_qdxml_replace](https://github.com/fei7yang/dc_qdxml_replace)** — Hostname replacement tool for TC Quick Deploy XML
 
 ## License
 

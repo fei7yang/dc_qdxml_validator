@@ -17,6 +17,12 @@ XML路径:
   dc_qdxml_validator D:\\myfile.xml --all     校验并生成全量报告
   dc_qdxml_validator D:\\myfile.xml --report fnd0_serverManager
   dc_qdxml_validator D:\\myfile.xml --report fnd0_blserver --client
+
+设计原则:
+  所有校验规则从 XML 内容动态推断，不依赖任何外部映射文件或硬编码 hostname。
+  集群归属从组件的 fnd0_serverManagerDisplayClusterId 属性读取。
+  特殊角色（DISP/DC/VIS）通过组件 id 交叉识别。
+  新增/删除服务器后无需修改本工具，直接跑即可。
 """
 import sys
 import os
@@ -28,22 +34,6 @@ from collections import defaultdict
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-
-# ===== 默认路径 =====
-# 不硬编码桌面路径，自动查找 exe/脚本所在目录的 .xml 文件
-
-# ===== Cluster 定义 =====
-CLUSTERS = {
-    'TcClusterJiTuan1':    [f'APP{i:02d}' for i in range(1, 11)],
-    'TcClusterJiTuan2':    [f'APP{i:02d}' for i in range(11, 21)],
-    'TcClusterJiTuan3':    [f'APP{i:02d}' for i in range(21, 31)],
-    'TcClusterJiTuan4':    [f'APP{i:02d}' for i in range(31, 41)],
-    'TcClusterXinJishuYuan': [f'APP{i:02d}' for i in range(41, 43)],
-    'TcClusterJiChuYuan':  [f'APP{i:02d}' for i in range(43, 45)],
-    'TcClusterJieKou':     [f'APP{i:02d}' for i in range(45, 53)],
-    'TcClusterTest':       [f'APP{i:02d}' for i in range(53, 55)],
-    'TcClusterHaiWai':     [f'APP{i:02d}' for i in range(55, 57)],
-}
 
 # ===== 全量报告组件列表 =====
 COMPS = [
@@ -62,20 +52,8 @@ CLIENTS = [
 ]
 
 # ===================================================================
-# 共享工具函数
+# 共享工具函数 — 纯动态，不依赖硬编码 hostname
 # ===================================================================
-
-def get_cluster(app):
-    for cname, apps in CLUSTERS.items():
-        if app in apps:
-            return cname, apps
-    return None, []
-
-def get_cluster_name(app):
-    for cname, apps in CLUSTERS.items():
-        if app in apps:
-            return cname
-    return '-'
 
 def parse_xml(path):
     p = etree.XMLParser(remove_blank_text=False, encoding='utf-8')
@@ -94,8 +72,77 @@ def get_clients_by_id(tree, cid):
     qcl = tree.getroot().find('quickDeployClients')
     return [c for c in qcl if c.tag == 'client' and c.get('id') == cid]
 
+def extract_num(s):
+    """从字符串提取最后一个数字，如 jttcapp01→1, APP55→55, PS-AW-02→2"""
+    m = re.search(r'(\d+)(?!\d)', s)
+    return int(m.group(1)) if m else None
+
+def build_clusters(tree):
+    """从 XML 动态构建集群映射: {clusterName: [machineName, ...]}
+    读取每个 SM 组件的 fnd0_serverManagerDisplayClusterId 属性"""
+    clusters = defaultdict(list)
+    for sm in get_components(tree, 'fnd0_serverManager'):
+        mn = sm.get('machineName')
+        cid_prop = [p.get('value') for p in sm.findall('property')
+                    if p.get('id') == 'fnd0_serverManagerDisplayClusterId']
+        cluster = cid_prop[0] if cid_prop else None
+        if cluster:
+            clusters[cluster].append(mn)
+    # 排序每个集群内的机器
+    for k in clusters:
+        clusters[k].sort(key=lambda x: (extract_num(x) or 999, x))
+    return dict(clusters)
+
+def get_cluster_for(tree, machine, clusters):
+    """返回 (clusterName, members) 或 (None, [])"""
+    for cname, members in clusters.items():
+        if machine in members:
+            return cname, members
+    return None, []
+
+def get_cluster_name_for(tree, machine, clusters):
+    for cname, members in clusters.items():
+        if machine in members:
+            return cname
+    return '-'
+
+def is_sm_machine(tree, machine):
+    """machine 是否有 fnd0_serverManager 组件"""
+    return machine in set(c.get('machineName') for c in get_components(tree, 'fnd0_serverManager'))
+
+def is_disp_machine(tree, machine):
+    """machine 是否有 fnd0_dispatcherModule 组件"""
+    return machine in set(c.get('machineName') for c in get_components(tree, 'fnd0_dispatcherModule'))
+
+def find_corporate_machine(tree):
+    """找到 corporateserver 所在机器名"""
+    corps = get_components(tree, 'fnd0_corporateserver')
+    return corps[0].get('machineName') if corps else None
+
+def find_msf_machine(tree):
+    """找到 microservice 所在机器名"""
+    msfs = get_components(tree, 'fnd0_microservice')
+    return msfs[0].get('machineName') if msfs else None
+
+def find_db_machine(tree):
+    """找到 serverpool_DBConfig 所在机器名"""
+    dbs = get_components(tree, 'fnd0_serverpool_DBConfig')
+    return dbs[0].get('machineName') if dbs else None
+
+def find_console_machine(tree):
+    """找到 servermgrconsole 所在机器名"""
+    consoles = get_components(tree, 'fnd0_servermgrconsole')
+    return consoles[0].get('machineName') if consoles else None
+
+def find_vis_machines(tree):
+    """找到所有 vispoolassigner 机器名（排序）"""
+    vis = get_components(tree, 'aws2_vispoolassigner')
+    machines = sorted([c.get('machineName') for c in vis], key=lambda x: (extract_num(x) or 999, x))
+    return machines
+
 def condense_machines(machines):
-    """按前缀分组压缩机器名: APP01-56, FSC01-08, ..."""
+    """按前缀分组压缩机器名: APP01-56, FSC01-08, ...
+    支持任意格式的 machineName，按数字后缀压缩"""
     if not machines:
         return ''
     groups = defaultdict(list)
@@ -140,6 +187,7 @@ def format_cts(cts):
 
 def run_check(xml_path):
     tree = parse_xml(xml_path)
+    clusters = build_clusters(tree)
     ok = warn = err = 0
     lines = []
 
@@ -155,38 +203,53 @@ def run_check(xml_path):
         lines.append('')
         lines.append(f'═══ {title} ═══')
 
+    # 动态发现关键机器
+    corp_machine = find_corporate_machine(tree)
+    msf_machine = find_msf_machine(tree)
+    db_machine = find_db_machine(tree)
+    vis_machines = find_vis_machines(tree)
+    total_web = len(get_components(tree, 'fnd0_j2ee_tcwebtier'))
+    total_sm = len(get_components(tree, 'fnd0_serverManager'))
+
     # R1
     section('规则1: Web → Pool (full-mesh intra-cluster)')
     webs = get_components(tree, 'fnd0_j2ee_tcwebtier')
     total_connections = 0
+    expected_total = sum(len(m) for m in clusters.values())  # 每个 SM 连集群内所有 SM
     for web in webs:
         machine = web.get('machineName')
-        cname, capps = get_cluster(machine)
-        if not capps:
+        cname, members = get_cluster_for(tree, machine, clusters)
+        if not members:
             add('warn', f'{machine} 不在已知cluster中')
             continue
         sm_conns = [ct.get('machineName') for ct in web.findall('connectedTo')
                     if ct.get('component') == 'fnd0_serverManager']
-        expected = capps
         total_connections += len(sm_conns)
-        missing = set(expected) - set(sm_conns)
-        extra = set(sm_conns) - set(expected)
+        missing = set(members) - set(sm_conns)
+        extra = set(sm_conns) - set(members)
         if not missing and not extra:
-            add('ok', f'{machine} ({cname}) → {len(sm_conns)}/{len(expected)} Pool ✓')
+            add('ok', f'{machine} ({cname}) → {len(sm_conns)}/{len(members)} Pool ✓')
         else:
-            msg = f'{machine} ({cname}) → {len(sm_conns)}/{len(expected)} Pool'
+            msg = f'{machine} ({cname}) → {len(sm_conns)}/{len(members)} Pool'
             if missing: msg += f' 缺{missing}'
             if extra: msg += f' 多{extra}'
             add('err', msg)
-    add('ok', f'连线总数: {total_connections}/480 (预期480)')
+    add('ok', f'连线总数: {total_connections} (集群内SM全连接)')
 
     # R2
     section('规则2: Gateway → VisPoolAssigner (奇偶配对)')
     gateways = get_components(tree, 'aws2_client_gateway_webtier')
     for gw in gateways:
         machine = gw.get('machineName')
-        num = int(machine[3:])
-        expected_vis = 'VIS01' if num % 2 == 1 else 'VIS02'
+        num = extract_num(machine)
+        if num is None:
+            add('warn', f'{machine} 无法提取数字编号，跳过奇偶判断')
+            continue
+        # 奇→vis_machines[0], 偶→vis_machines[1]
+        if len(vis_machines) < 2:
+            add('warn', f'VIS机器不足2个，跳过奇偶配对')
+            continue
+        expected_vis = vis_machines[0] if num % 2 == 1 else vis_machines[1]
         vis_conns = [ct.get('machineName') for ct in gw.findall('connectedTo')
                      if ct.get('component') == 'aws2_vispoolassigner']
         if expected_vis in vis_conns and len(vis_conns) == 1:
@@ -199,28 +262,28 @@ def run_check(xml_path):
     bl_servers = get_clients_by_id(tree, 'fnd0_blserver')
     for bl in bl_servers:
         machine = bl.get('machineName')
-        if machine not in ('DISP01', 'DISP02'):
+        if not is_disp_machine(tree, machine):
             continue
         web_conns = [ct.get('machineName') for ct in bl.findall('connectedTo')
                      if ct.get('component') == 'fnd0_j2ee_tcwebtier']
-        expected = 'APP45' if machine == 'DISP01' else 'APP46'
-        if expected in web_conns and len(web_conns) >= 1:
+        if web_conns:
             add('ok', f'{machine} BL → Web {web_conns} ✓')
         else:
-            add('err', f'{machine} BL → Web {web_conns} (期望{expected})')
+            add('err', f'{machine} BL 未连接Web')
 
     # R4
     section('规则4: BL Server-DC → Web')
     for bl in bl_servers:
         machine = bl.get('machineName')
-        if machine != 'DC01':
+        # DC BL: 不是 DISP 机器，也不是 SM 机器（即非APP非DISP的独立BL）
+        if is_disp_machine(tree, machine) or is_sm_machine(tree, machine):
             continue
         web_conns = [ct.get('machineName') for ct in bl.findall('connectedTo')
                      if ct.get('component') == 'fnd0_j2ee_tcwebtier']
-        if 'APP47' in web_conns and len(web_conns) >= 1:
-            add('ok', f'DC01 BL → Web {web_conns} ✓')
+        if web_conns:
+            add('ok', f'{machine} BL → Web {web_conns} ✓')
         else:
-            add('err', f'DC01 BL → Web {web_conns} (期望APP47)')
+            add('err', f'{machine} BL 未连接Web')
 
     # R5
     section('规则5: Dispatcher Client-4tier → Web')
@@ -258,16 +321,27 @@ def run_check(xml_path):
 
     # R9
     section('规则9: 全连接组件 (新增APP时须同步)')
-    web_total = len(get_components(tree, 'fnd0_j2ee_tcwebtier'))
-    sm_total = len(get_components(tree, 'fnd0_serverManager'))
-    checks = [
-        ('fnd0_servermgrconsole', 'APP01', 'fnd0_serverManager', sm_total, 'SM全连接'),
-        ('fnd0_servermgrconsole', 'APP01', 'fnd0_j2ee_tcwebtier', web_total, 'Web全连接'),
-        ('fnd0_microservice', 'MSF01', 'fnd0_j2ee_tcwebtier', web_total, 'Web全连接'),
-        ('fnd0_dispatcherModule', 'DISP01', 'fnd0_j2ee_tcwebtier', web_total, 'Web全连接'),
-        ('fnd0_dispatcherModule', 'DISP02', 'fnd0_j2ee_tcwebtier', web_total, 'Web全连接'),
-    ]
-    for cid, machine, ctype, expected, desc in checks:
+    # 动态发现所有"全连接"组件：connectedTo 数量 = 目标组件总数的
+    full_mesh_checks = []
+    # servermgrconsole → 全部 SM + 全部 Web
+    if corp_machine:
+        for con in get_components(tree, 'fnd0_servermgrconsole'):
+            mn = con.get('machineName')
+            full_mesh_checks.append(('fnd0_servermgrconsole', mn, 'fnd0_serverManager', total_sm, 'SM全连接'))
+            full_mesh_checks.append(('fnd0_servermgrconsole', mn, 'fnd0_j2ee_tcwebtier', total_web, 'Web全连接'))
+    # microservice → 全部 Web
+    if msf_machine:
+        for ms in get_components(tree, 'fnd0_microservice'):
+            mn = ms.get('machineName')
+            full_mesh_checks.append(('fnd0_microservice', mn, 'fnd0_j2ee_tcwebtier', total_web, 'Web全连接'))
+    # dispatcherModule → 全部 Web + 全部 BL
+    total_bl = len(get_clients_by_id(tree, 'fnd0_blserver'))
+    for d in get_components(tree, 'fnd0_dispatcherModule'):
+        mn = d.get('machineName')
+        full_mesh_checks.append(('fnd0_dispatcherModule', mn, 'fnd0_j2ee_tcwebtier', total_web, 'Web全连接'))
+        full_mesh_checks.append(('fnd0_dispatcherModule', mn, 'fnd0_blserver', total_bl, 'BL全连接'))
+
+    for cid, machine, ctype, expected, desc in full_mesh_checks:
         candidates = get_components(tree, cid)
         for c in candidates:
             if c.get('machineName') != machine:
@@ -287,10 +361,10 @@ def run_check(xml_path):
     else:
         add('err', f'corporateserver: {len(corps)}个 (应为1)')
     bls_count = len(get_clients_by_id(tree, 'fnd0_blserver'))
-    if bls_count >= sm_total:
-        add('ok', f'blserver: {bls_count}个 ≥ SM({sm_total}) ✓')
+    if bls_count >= total_sm:
+        add('ok', f'blserver: {bls_count}个 ≥ SM({total_sm}) ✓')
     else:
-        add('err', f'blserver: {bls_count}个 < SM({sm_total})')
+        add('err', f'blserver: {bls_count}个 < SM({total_sm})')
 
     # 格式检查
     section('格式检查')
@@ -347,9 +421,15 @@ def run_check(xml_path):
 def generate_report(xml_path, out_dir, cid, is_client=False):
     config_name = get_config_name(xml_path)
     tree = parse_xml(xml_path)
+    clusters = build_clusters(tree)
     parent = (tree.getroot().find('quickDeployClients') if is_client
               else tree.getroot().find('quickDeployComponents'))
     tag = 'client' if is_client else 'component'
+
+    # 动态发现关键机器
+    corp_machine = find_corporate_machine(tree)
+    msf_machine = find_msf_machine(tree)
+    db_machine = find_db_machine(tree)
 
     items = sorted([c for c in parent if c.tag == tag and c.get('id') == cid],
                    key=lambda x: x.get('machineName', ''))
@@ -394,36 +474,41 @@ def generate_report(xml_path, out_dir, cid, is_client=False):
     ct_data = []
     for c in items:
         machine = c.get('machineName', '')
-        cluster = (get_cluster_name(machine)
-                   if not is_client and machine.startswith('APP') else '-')
+        cluster = (get_cluster_name_for(tree, machine, clusters)
+                   if not is_client and is_sm_machine(tree, machine) else '-')
         cts = [(ct.get('component'), ct.get('machineName')) for ct in c.findall('connectedTo')]
 
         is_ok = True
         problems = []
 
         if cid == 'fnd0_serverManager':
-            expected = {('fnd0_servermgrconsole', 'APP01'),
-                        ('fnd0_serverpool_DBConfig', 'DBSCAN'),
-                        ('fnd0_tcdbserver', 'DBSCAN')}
+            # SM 应连: servermgrconsole(在corp机器上) + DBConfig(在db机器上) + DBServer(在db机器上)
+            expected = set()
+            if corp_machine:
+                expected.add(('fnd0_servermgrconsole', corp_machine))
+            if db_machine:
+                expected.add(('fnd0_serverpool_DBConfig', db_machine))
+                expected.add(('fnd0_tcdbserver', db_machine))
             actual = set(cts)
             is_ok = (actual == expected)
             if not is_ok:
                 if expected - actual: problems.append(f'缺{expected-actual}')
                 if actual - expected: problems.append(f'多{actual-expected}')
         elif cid == 'fnd0_j2ee_tcwebtier':
-            capps = CLUSTERS.get(cluster, [])
-            sm_ok = set(m for t, m in cts if t == 'fnd0_serverManager') == set(capps)
-            has_ms = ('fnd0_microservice', 'MSF01') in cts
-            has_console = ('fnd0_servermgrconsole', 'APP01') in cts
+            # Web 应连: 集群内全部 SM + microservice + servermgrconsole
+            cmembers = clusters.get(cluster, [])
+            sm_ok = set(m for t, m in cts if t == 'fnd0_serverManager') == set(cmembers)
+            has_ms = any(t == 'fnd0_microservice' for t, m in cts)
+            has_console = any(t == 'fnd0_servermgrconsole' for t, m in cts)
             is_ok = sm_ok and has_ms and has_console
             if not sm_ok:
                 sm_actual = set(m for t, m in cts if t == 'fnd0_serverManager')
-                missing = set(capps) - sm_actual
-                extra = sm_actual - set(capps)
+                missing = set(cmembers) - sm_actual
+                extra = sm_actual - set(cmembers)
                 if missing: problems.append(f'SM缺{missing}')
                 if extra: problems.append(f'SM多{extra}')
-            if not has_ms: problems.append('缺MSF01')
-            if not has_console: problems.append('缺console')
+            if not has_ms: problems.append('缺Microservice')
+            if not has_console: problems.append('缺Console')
 
         ct_data.append({
             'machine': machine, 'cluster': cluster, 'ct_count': len(cts),
@@ -653,8 +738,9 @@ def main():
         print(f'❌ 找不到 XML 文件: {xml_path}')
         sys.exit(1)
 
-    # 输出目录 = exe/脚本所在目录（或 XML 所在目录）
-    out_dir = base_dir
+    # 输出目录 = exe/脚本所在目录/validator/
+    out_dir = os.path.join(base_dir, 'validator')
+    os.makedirs(out_dir, exist_ok=True)
     cfg = get_config_name(xml_path)
 
     # 双击（无参数）默认 → --all 生成报告 + 打开浏览器
