@@ -73,9 +73,11 @@ def get_clients_by_id(tree, cid):
     return [c for c in qcl if c.tag == 'client' and c.get('id') == cid]
 
 def extract_num(s):
-    """从字符串提取最后一个数字，如 jttcapp01→1, APP55→55, PS-AW-02→2"""
-    m = re.search(r'(\d+)(?!\d)', s)
-    return int(m.group(1)) if m else None
+    """从字符串提取最后一个数字串，如 jttcapp01→1, APP55→55, PS-AW-02→2, div2tcapp01→1
+    注意：必须用最后一个数字串，避免 machineName 前缀中夹带的孤立数字
+    （如 div2tc 前缀的 '2'）被误当作机器编号。"""
+    nums = re.findall(r'\d+', s)
+    return int(nums[-1]) if nums else None
 
 def build_clusters(tree):
     """从 XML 动态构建集群映射: {clusterName: [machineName, ...]}
@@ -269,7 +271,7 @@ def run_check(xml_path):
         if web_conns:
             add('ok', f'{machine} BL → Web {web_conns} ✓')
         else:
-            add('err', f'{machine} BL 未连接Web')
+            add('warn', f'{machine} BL 未连Web (DC导入时通常会自动补)')
 
     # R4
     section('规则4: BL Server-DC → Web')
@@ -283,7 +285,7 @@ def run_check(xml_path):
         if web_conns:
             add('ok', f'{machine} BL → Web {web_conns} ✓')
         else:
-            add('err', f'{machine} BL 未连接Web')
+            add('warn', f'{machine} BL 未连Web (DC导入时通常会自动补)')
 
     # R5
     section('规则5: Dispatcher Client-4tier → Web')
@@ -318,6 +320,20 @@ def run_check(xml_path):
             add('ok', f'{machine} → Web {web_conns} ✓')
         else:
             add('err', f'{machine} 未连接Web')
+
+    # R8
+    section('规则8: Gateway → 同机 Web (same-host)')
+    gws = get_components(tree, 'aws2_client_gateway_webtier')
+    for gw in gws:
+        machine = gw.get('machineName')
+        web_conns = [ct.get('machineName') for ct in gw.findall('connectedTo')
+                     if ct.get('component') == 'fnd0_j2ee_tcwebtier']
+        if machine in web_conns:
+            add('ok', f'{machine} Gateway → 同机Web {machine} ✓')
+        elif web_conns:
+            add('err', f'{machine} Gateway 未连本机Web (连了 {web_conns})')
+        else:
+            add('err', f'{machine} Gateway 未连接任何Web')
 
     # R9
     section('规则9: 全连接组件 (新增APP时须同步)')
@@ -405,6 +421,143 @@ def run_check(xml_path):
             last_seen[ct_type] = i
     if group_issues == 0:
         add('ok', '所有组件 connectedTo 同类型连续 ✓')
+
+    # R12 悬空 connectedTo 检查
+    section('规则12: 悬空 connectedTo (目标必须存在)')
+    valid_targets = set()
+    for c in tree.getroot().find('quickDeployComponents'):
+        if c.tag == 'component':
+            valid_targets.add((c.get('id'), c.get('machineName')))
+    for c in tree.getroot().find('quickDeployClients'):
+        if c.tag == 'client':
+            valid_targets.add((c.get('id'), c.get('machineName')))
+    dangling = 0
+    for parent in (tree.getroot().find('quickDeployComponents'), tree.getroot().find('quickDeployClients')):
+        for c in parent:
+            if c.tag not in ('component', 'client'):
+                continue
+            src = f"{c.get('id')}@{c.get('machineName')}"
+            for ct in c.findall('connectedTo'):
+                tgt = (ct.get('component'), ct.get('machineName'))
+                if tgt not in valid_targets:
+                    dangling += 1
+                    add('err', f'{src} → 悬空引用 {tgt[0]}@{tgt[1]}')
+    if dangling == 0:
+        add('ok', '无悬空 connectedTo ✓')
+
+    # R13 dispatcherclient Web Tier 数量 (≤1)
+    # 注意：dispatcherclient 在不同部署中可能是 component 也可能是 client，两者都查
+    section('规则13: Dispatcher Client Web Tier 数量 (≤1)')
+    for dc in get_components(tree, 'fnd0_dispatcherclient') + get_clients_by_id(tree, 'fnd0_dispatcherclient'):
+        machine = dc.get('machineName')
+        n = len([ct for ct in dc.findall('connectedTo') if ct.get('component') == 'fnd0_j2ee_tcwebtier'])
+        if n > 1:
+            add('err', f'{machine} dispatcherclient 连了 {n} 个Web (DC导入要求≤1)')
+        else:
+            add('ok', f'{machine} dispatcherclient Web={n} (≤1) ✓')
+
+    # R14 webtier 不应反向连 gateway_webtier
+    section('规则14: Web Tier 不应反向连 Gateway')
+    rev = 0
+    for web in get_components(tree, 'fnd0_j2ee_tcwebtier'):
+        for ct in web.findall('connectedTo'):
+            if ct.get('component') == 'aws2_client_gateway_webtier':
+                rev += 1
+                add('err', f"{web.get('machineName')} Web 反向连 Gateway {ct.get('machineName')}")
+    if rev == 0:
+        add('ok', '无 Web 反向连 Gateway ✓')
+
+    # R15 FSC Mesh 对称性 (A→B 则 B→A)
+    section('规则15: FSC Mesh 对称性')
+    fscs = get_components(tree, 'fnd0_fsc')
+    adj = {}
+    for f in fscs:
+        mn = f.get('machineName')
+        adj[mn] = set(ct.get('machineName') for ct in f.findall('connectedTo')
+                      if ct.get('component') == 'fnd0_fsc')
+    asym = 0
+    for a, peers in adj.items():
+        for b in peers:
+            if b in adj and a not in adj[b]:
+                asym += 1
+                add('warn', f'FSC {a} → {b} 但 {b} 未回连 {a}')
+    isolated = [mn for mn, p in adj.items() if len(p) == 0]
+    for mn in isolated:
+        add('warn', f'FSC {mn} 无任何 FSC 互联')
+    if asym == 0 and not isolated:
+        add('ok', f'FSC mesh 对称, {len(fscs)} 个全互联 ✓')
+
+    # R16 tccs 两层一致性 (类型级, 不硬编码数量)
+    section('规则16: tccs 两层一致性 (类型级)')
+    tccs_list = get_clients_by_id(tree, 'fnd0_tccs')
+    for t in tccs_list:
+        mn = t.get('machineName')
+        types = set(ct.get('component') for ct in t.findall('connectedTo'))
+        need = {'fnd0_corporateserver', 'fnd0_fsc', 'fnd0_j2ee_tcwebtier'}
+        missing = need - types
+        if missing:
+            add('warn', f'{mn} tccs 缺出向类型 {missing}')
+        else:
+            add('ok', f'{mn} tccs 出向含 corp+fsc+web ✓')
+    tccs_machines = set(t.get('machineName') for t in tccs_list)
+    for rcid in ('fnd0_2tierrichclient', 'fnd0_4tierrichclient'):
+        for rc in get_clients_by_id(tree, rcid):
+            mn = rc.get('machineName')
+            if mn not in tccs_machines:
+                add('warn', f'{mn} 有 {rcid} 但无对应 tccs')
+
+    # R17 Server Manager Pool 数值合理性
+    section('规则17: Server Manager Pool 数值合理性')
+    for sm in get_components(tree, 'fnd0_serverManager'):
+        mn = sm.get('machineName')
+        props = {p.get('id'): p.get('value') for p in sm.findall('property')}
+        mx = props.get('fnd0_maxServersCount'); mw = props.get('fnd0_minWarmServersCount')
+        avail = props.get('fnd0_availableServerAt')
+        try:
+            if mx is not None and mw is not None and int(mw) > int(mx):
+                add('err', f'{mn} minWarm({mw}) > max({mx})')
+                continue
+        except ValueError:
+            pass
+        if avail is None or not avail.strip():
+            add('warn', f'{mn} availableServerAt 为空')
+        else:
+            add('ok', f'{mn} pool max={mx} minWarm={mw} ✓')
+
+    # R18 machineName 格式检查
+    section('规则18: machineName 格式检查')
+    bad_mn = 0
+    for parent in (tree.getroot().find('quickDeployComponents'), tree.getroot().find('quickDeployClients')):
+        for c in parent:
+            if c.tag not in ('component', 'client'):
+                continue
+            mn = c.get('machineName', '')
+            if '@' in mn or '://' in mn or ' ' in mn:
+                bad_mn += 1
+                add('err', f"{c.get('id')}@{mn} machineName 含非法字符(@/:/空格)")
+    if bad_mn == 0:
+        add('ok', '所有 machineName 格式合法 ✓')
+
+    # R19 加密属性值非空
+    section('规则19: 加密属性值非空')
+    enc_empty = 0
+    for parent in (tree.getroot().find('quickDeployComponents'), tree.getroot().find('quickDeployClients')):
+        for c in parent:
+            if c.tag not in ('component', 'client'):
+                continue
+            for p in c.findall('property'):
+                if p.get('encrypted') == 'true' and not (p.get('value') or '').strip():
+                    enc_empty += 1
+                    add('warn', f"{c.get('id')}@{c.get('machineName')} 属性 {p.get('id')} 加密但值为空")
+    if enc_empty == 0:
+        add('ok', '无加密属性空值 ✓')
+
+    # R20 根节点 configName
+    section('规则20: 根节点 configName')
+    if tree.getroot().get('configName'):
+        add('ok', f"configName = {tree.getroot().get('configName')} ✓")
+    else:
+        add('warn', '根节点缺少 configName 属性')
 
     # 总结
     section('总结')
@@ -755,7 +908,10 @@ def main():
         print(f'\n📄 报告索引: {index_path}')
         import webbrowser
         webbrowser.open(f'file:///{index_path}')
-        input('\n按 Enter 键退出...')
+        try:
+            input('\n按 Enter 键退出...')
+        except EOFError:
+            pass  # 无交互终端（如管道/自动化调用）时静默退出
         sys.exit(errors)
 
     elif '--report' in remaining:
@@ -769,7 +925,10 @@ def main():
         generate_report(xml_path, out_dir, cid, is_client=is_client)
         html_path = os.path.join(out_dir, f'report_{cid}.html')
         print(f'\n📄 报告: {html_path}')
-        input('\n按 Enter 键退出...')
+        try:
+            input('\n按 Enter 键退出...')
+        except EOFError:
+            pass  # 无交互终端（如管道/自动化调用）时静默退出
         sys.exit(0)
 
     else:
@@ -779,7 +938,10 @@ def main():
         print(report)
         print()
         print(f'💡 --all 生成全量报告  |  --report <组件ID> 生成单个报告  |  --help 查看说明')
-        input('\n按 Enter 键退出...')
+        try:
+            input('\n按 Enter 键退出...')
+        except EOFError:
+            pass  # 无交互终端（如管道/自动化调用）时静默退出
         sys.exit(errors)
 
 
